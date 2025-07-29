@@ -1,0 +1,246 @@
+import os
+import cv2
+import numpy as np
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import List, Dict, Any
+import tempfile
+import shutil
+
+from services.yolo_model import YOLOModel
+from config.settings import get_settings
+
+app = FastAPI(title="YOLO Video Analysis Server", version="1.0.0")
+settings = get_settings()
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize YOLO model
+yolo_model = YOLOModel(settings.model_path)
+
+class AnalysisRequest(BaseModel):
+    video_url: str = None
+
+class AnalysisResponse(BaseModel):
+    defects: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+    processing_time: float
+
+@app.post("/analyze", response_model=AnalysisResponse)
+async def analyze_video(video_file: UploadFile = File(...)):
+    """Analyze a video file with YOLO model"""
+    try:
+        # Save uploaded video to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
+            shutil.copyfileobj(video_file.file, tmp_file)
+            video_path = tmp_file.name
+        
+        # Process the video
+        results = await process_video_with_yolo(video_path)
+        
+        # Clean up temporary file
+        os.unlink(video_path)
+        
+        return results
+        
+    except Exception as e:
+        # Clean up on error
+        if 'video_path' in locals():
+            os.unlink(video_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/analyze-url")
+async def analyze_video_url(request: AnalysisRequest):
+    """Analyze a video from URL with YOLO model"""
+    try:
+        if not request.video_url:
+            raise HTTPException(status_code=400, detail="video_url is required")
+        
+        # Download video from URL
+        video_path = await download_video_from_url(request.video_url)
+        
+        # Process the video
+        results = await process_video_with_yolo(video_path)
+        
+        # Clean up temporary file
+        os.unlink(video_path)
+        
+        return results
+        
+    except Exception as e:
+        # Clean up on error
+        if 'video_path' in locals():
+            os.unlink(video_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def process_video_with_yolo(video_path: str) -> AnalysisResponse:
+    """Process video with YOLO model and return results"""
+    import time
+    start_time = time.time()
+    
+    # Open video
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file: {video_path}")
+    
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
+    
+    print(f"Processing video: {fps} FPS, {total_frames} frames, {duration:.2f}s duration")
+    
+    # Extract frames at intervals (every 1 second)
+    frame_interval = int(fps) if fps > 0 else 30
+    defects = []
+    frame_count = 0
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Process every nth frame (every second)
+        if frame_count % frame_interval == 0:
+            # Run YOLO detection
+            detections = await yolo_model.detect(frame)
+            
+            # Process detections
+            for detection in detections:
+                if detection.confidence > settings.confidence_threshold:
+                    defect = {
+                        "timestamp": frame_count / fps if fps > 0 else frame_count / 30,
+                        "type": detection.class_name,
+                        "confidence": float(detection.confidence),
+                        "location": {
+                            "center": [float(detection.bbox[0]), float(detection.bbox[1])],
+                            "bbox": {
+                                "x": float(detection.bbox[0]),
+                                "y": float(detection.bbox[1]),
+                                "width": float(detection.bbox[2]),
+                                "height": float(detection.bbox[3])
+                            },
+                            "frame_position": f"({int(detection.bbox[0])}, {int(detection.bbox[1])})"
+                        },
+                        "severity": determine_severity(detection.confidence),
+                        "description": f"Detected {detection.class_name} with {detection.confidence:.2f} confidence",
+                        "recommendations": get_recommendations(detection.class_name),
+                        "frame_info": {
+                            "frame_number": frame_count,
+                            "frame_time": frame_count / fps if fps > 0 else frame_count / 30,
+                            "video_fps": fps
+                        }
+                    }
+                    defects.append(defect)
+        
+        frame_count += 1
+    
+    cap.release()
+    
+    processing_time = time.time() - start_time
+    
+    # Generate summary
+    summary = generate_summary(defects)
+    
+    return AnalysisResponse(
+        defects=defects,
+        summary=summary,
+        processing_time=processing_time
+    )
+
+async def download_video_from_url(video_url: str) -> str:
+    """Download video from URL to temporary file"""
+    import httpx
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", video_url) as response:
+                response.raise_for_status()
+                
+                # Create temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
+                    async for chunk in response.aiter_bytes():
+                        tmp_file.write(chunk)
+                    return tmp_file.name
+                    
+    except Exception as e:
+        raise ValueError(f"Failed to download video from URL: {e}")
+
+def determine_severity(confidence: float) -> str:
+    """Determine severity based on confidence score"""
+    if confidence > 0.8:
+        return "high"
+    elif confidence > 0.6:
+        return "medium"
+    else:
+        return "low"
+
+def get_recommendations(defect_type: str) -> List[str]:
+    """Get recommendations based on defect type"""
+    recommendations = {
+        "crack": ["Schedule immediate inspection", "Consider pipe replacement"],
+        "corrosion": ["Apply protective coating", "Monitor corrosion rate"],
+        "blockage": ["Perform cleaning", "Check for root intrusion"],
+        "leak": ["Locate source", "Apply sealant or replace section"],
+        "root": ["Remove roots", "Apply root treatment", "Install root barrier"],
+        "sediment": ["Clean pipe", "Check for upstream issues"],
+        "joint": ["Inspect joint", "Consider joint repair"],
+        "deformation": ["Assess structural integrity", "Consider replacement"]
+    }
+    return recommendations.get(defect_type.lower(), ["Schedule maintenance"])
+
+def generate_summary(defects: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Generate summary of analysis results"""
+    total_defects = len(defects)
+    critical_issues = len([d for d in defects if d["severity"] == "high"])
+    
+    # Group by defect type
+    defect_types = {}
+    for defect in defects:
+        defect_type = defect["type"]
+        if defect_type not in defect_types:
+            defect_types[defect_type] = 0
+        defect_types[defect_type] += 1
+    
+    return {
+        "totalDefects": total_defects,
+        "criticalIssues": critical_issues,
+        "defectTypes": defect_types,
+        "recommendedActions": f"Found {total_defects} defects with {critical_issues} critical issues requiring attention"
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy", 
+        "model_loaded": yolo_model.is_loaded(),
+        "model_path": settings.model_path
+    }
+
+@app.get("/model-info")
+async def model_info():
+    """Get information about the loaded YOLO model"""
+    if not yolo_model.is_loaded():
+        raise HTTPException(status_code=500, detail="Model not loaded")
+    
+    return {
+        "model_path": settings.model_path,
+        "confidence_threshold": settings.confidence_threshold,
+        "device": settings.device,
+        "classes": yolo_model.model.names if yolo_model.model else []
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port) 
